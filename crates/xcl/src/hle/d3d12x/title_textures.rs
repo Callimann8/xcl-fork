@@ -324,6 +324,8 @@ pub fn counts() -> (usize, u64) {
 
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
+    // (a new texture object, or the address of an old one again: its first upload is not left out)
+    LAST_CONTENT.lock().unwrap().remove(&(res as usize));
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
     // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
     // title's bytes are not the resource's texels
@@ -495,6 +497,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
 
 /// The PC texture was released for good.
 pub fn forget(res: usize) {
+    LAST_CONTENT.lock().unwrap().remove(&res);
     let (removed, to_remap) = {
         let mut t = TEXTURES.lock().unwrap();
         let (removed, delta, remap_ptrs) = t.remove(res);
@@ -765,6 +768,41 @@ unsafe fn refresh_once(queue: *mut c_void) {
     upload_all(todo);
 }
 
+/// texture → `content_hash` of its memory at its last upload
+static LAST_CONTENT: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+static UNCHANGED: AtomicU64 = AtomicU64::new(0);
+
+/// `XCL_TEXTURE_SKIP_UNCHANGED=0` uploads a texture whenever its pages were written, as before.
+fn unchanged_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TEXTURE_SKIP_UNCHANGED").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Whether texture `res` was last uploaded from memory with hash `h`; `h` is remembered as its
+/// content from here on (the caller uploads it when this is false).
+fn same_as_last_upload(res: usize, h: u64) -> bool {
+    LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+}
+
+/// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
+/// 8-byte words: gigabytes a second; not for anything adversarial).
+fn content_hash(b: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = [K, K.rotate_left(17), K.rotate_left(31), K.rotate_left(47)];
+    let mut chunks = b.chunks_exact(32);
+    for c in &mut chunks {
+        for (k, lane) in h.iter_mut().enumerate() {
+            let v = u64::from_le_bytes(c[k * 8..k * 8 + 8].try_into().unwrap());
+            *lane = (*lane ^ v).wrapping_mul(K).rotate_left(29);
+        }
+    }
+    let mut tail = b.len() as u64;
+    for (k, &x) in chunks.remainder().iter().enumerate() {
+        tail = (tail ^ ((x as u64) << (8 * (k % 8)))).wrapping_mul(K).rotate_left(23);
+    }
+    h.iter().fold(tail, |a, &l| (a ^ l).wrapping_mul(K).rotate_left(27))
+}
+
 /// staging bytes of one batch at most
 const BATCH_BYTES: usize = 256 << 20;
 
@@ -786,6 +824,20 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
+            // The same bytes as at this texture's last upload: nothing to do. The write watch is
+            // per page and a title writes next to its textures (and rewrites what it wrote): a
+            // retail title's video planes and UI targets went up again for every submit, ~25 MB
+            // a presented frame where ~3 MB had changed, and the submits waited here.
+            if unchanged_skip() {
+                let h = content_hash(&read_committed(va, tex.size() as usize));
+                if same_as_last_upload(r.as_raw() as usize, h) {
+                    let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || (n.is_power_of_two() && n >= 1024) {
+                        crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
+                    }
+                    continue;
+                }
+            }
             device = dev;
             bytes += tex.size() as usize;
             let subs = subresources(va, &tex);
@@ -1017,6 +1069,172 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A texture is left out only when its memory hashes as at its own last upload, and a
+    /// texture that was forgotten (released, or its address registered again) is uploaded again.
+    #[test]
+    fn a_texture_with_unchanged_memory_is_left_out_until_it_is_forgotten() {
+        let (a, b) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize);
+        let mut mem = vec![0u8; 3 << 20];
+        mem[5] = 1;
+        let h = content_hash(&mem);
+        assert!(!same_as_last_upload(a, h), "the first upload is not left out");
+        assert!(same_as_last_upload(a, h), "the same bytes again: left out");
+        assert!(!same_as_last_upload(b, h), "another texture over the same bytes has its own first upload");
+        // one byte anywhere, also in the tail that is not a whole 32-byte step
+        for at in [0usize, 31, 32, (3 << 20) - 1] {
+            let mut m = mem.clone();
+            m[at] ^= 0x80;
+            assert_ne!(content_hash(&m), h, "byte {at} changed");
+        }
+        mem[(3 << 20) - 1] = 9;
+        let h2 = content_hash(&mem);
+        assert!(!same_as_last_upload(a, h2), "changed memory is uploaded");
+        assert!(same_as_last_upload(a, h2));
+        // the length is part of the content: a prefix of zeros is not the whole
+        assert_ne!(content_hash(&[0u8; 64]), content_hash(&[0u8; 96]));
+        forget(a);
+        assert!(!same_as_last_upload(a, h2), "forgotten: its next upload is a first one");
+        forget(a);
+        forget(b);
+    }
+
+    /// Real uploads, dirty-page detection and a source changing after registration:
+    /// bookkeeping alone cannot show that the bytes the GPU sees follow the mirror.
+    #[test]
+    fn gpu_mirror_upload_follows_cpu_writes_and_later_mapping_changes() {
+        use crate::hle::kernelx;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+        use windows_sys::Win32::System::Memory as mem;
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        // Larger than all four UMA windows together. These public allocations
+        // must use the watched Windows fallback, reserving space rather than RAM.
+        const SIZE: usize = 24usize << 30;
+        const OFFSET: usize = 0x2_0000;
+        const PAGE: usize = 0x1_0000;
+        struct Reservation(usize);
+        impl Drop for Reservation {
+            fn drop(&mut self) {
+                unsafe { kernelx::VirtualFree(self.0 as *mut c_void, 0, mem::MEM_RELEASE); }
+            }
+        }
+        struct RegisteredTexture(usize);
+        impl Drop for RegisteredTexture {
+            fn drop(&mut self) { forget(self.0); }
+        }
+        struct PhysicalPage { id: usize, at: usize }
+        impl Drop for PhysicalPage {
+            fn drop(&mut self) {
+                unsafe {
+                    if kernelx::physical_page_at(self.at) {
+                        kernelx::MapTitlePhysicalPages(self.at as *mut c_void, 1, 0, 4, std::ptr::null_mut());
+                    }
+                    kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut self.id);
+                }
+            }
+        }
+        unsafe fn reserve(protect: u32) -> Reservation {
+            let at = kernelx::VirtualAlloc(std::ptr::null(), SIZE, 0x2040_2000, protect) as usize;
+            assert_ne!(at, 0, "reserve-only fallback must succeed");
+            let reservation = Reservation(at);
+            assert!(!crate::gpu::uma::get().unwrap().contains(at), "exercise the Windows fallback");
+            assert!(kernelx::in_graphics_reservation(at), "fallback must be write-watched");
+            reservation
+        }
+        unsafe fn read_r8(dev: &ID3D12Device, queue: &ID3D12CommandQueue, texture: &ID3D12Resource) -> Vec<u8> {
+            own_work(|| {
+                let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                let mut total = 0;
+                dev.GetCopyableFootprints(&texture.GetDesc(), 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total));
+                let mut readback = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() },
+                    D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback,
+                ).unwrap();
+                let readback: ID3D12Resource = readback.unwrap();
+                let allocator: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+                let barrier = |before, after| D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(texture), Subresource: 0, StateBefore: before, StateAfter: after }) },
+                    ..Default::default()
+                };
+                list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(texture), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                queue.Signal(&fence, 1).unwrap();
+                crate::gpu::fence::wait(&fence, 1, dev, None, 5_000).unwrap();
+                let mut data = std::ptr::null_mut();
+                readback.Map(0, None, Some(&mut data)).unwrap();
+                let mut out = Vec::with_capacity(64 * 64);
+                for y in 0..64 {
+                    out.extend_from_slice(std::slice::from_raw_parts((data as *const u8).add(footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize), 64));
+                }
+                readback.Unmap(0, None);
+                out
+            })
+        }
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let cpu = reserve(mem::PAGE_READWRITE);
+            let gpu = reserve(0x801);
+            let (src, va) = (cpu.0 + OFFSET, gpu.0 + OFFSET);
+            assert_eq!(kernelx::mirrors::source(va), Some(src));
+            assert_eq!(kernelx::VirtualAlloc(src as *const c_void, PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize, src);
+            let console = console_desc(3, 64, 64, 1, 1, DXGI_FORMAT_R8_UNORM.0 as u32, 1);
+            assert!(xg::Texture::new(&console).unwrap().size() <= PAGE as u64);
+            let mut texture = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
+                D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+            ).unwrap();
+            let texture: ID3D12Resource = texture.unwrap();
+            let key = texture.as_raw() as usize;
+            register(raw_device, texture.as_raw(), va, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            let _registered = RegisteredTexture(key);
+            for value in [0x3D, 0x9A] {
+                std::ptr::write_bytes(src as *mut u8, value, PAGE);
+                refresh(queue.as_raw());
+                assert_eq!(read_r8(dev, &queue, &texture), vec![value; 64 * 64], "GPU contents follow CPU writes");
+                assert_eq!(address(key), Some(va), "the title address stays in the GPU view");
+            }
+            let (mut count, mut id) = (1usize, 0usize);
+            assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, &mut id), 1);
+            let mut mapped = PhysicalPage { id, at: va };
+            assert_eq!(kernelx::MapTitlePhysicalPages(va as *mut c_void, 1, 0, 4, &mut mapped.id) as usize, va);
+            assert!(kernelx::physical_page_at(va));
+            let mut info: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(mem::VirtualQuery(va as *const c_void, &mut info, std::mem::size_of_val(&info)), 0);
+            assert_eq!(info.State, mem::MEM_RESERVE, "exercise the lazy mapping before its first touch");
+            assert_eq!(mirror_source(va), va, "a mapped lazy page overrides the CPU mirror");
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &texture), vec![0; 64 * 64], "the untouched physical page supplies zeros");
+            std::ptr::write_bytes(va as *mut u8, 0xC7, PAGE);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &texture), vec![0xC7; 64 * 64]);
+            assert_eq!(kernelx::MapTitlePhysicalPages(va as *mut c_void, 1, 0, 4, std::ptr::null_mut()) as usize, va);
+            assert!(!kernelx::physical_page_at(va));
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &texture), vec![0x9A; 64 * 64], "unmapping restores the earlier CPU view");
+            assert_eq!(address(key), Some(va));
+            dev.GetDeviceRemovedReason().unwrap();
+        }
+    }
 
     /// A physical page mapped into a GPU view but not used yet (reserved until its first
     /// access, `kernelx::lazy`) is that address's own source, not the CPU view behind it.
@@ -1258,6 +1476,17 @@ mod tests {
             {
                 println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: tiled tier < 2");
                 return;
+            }
+            // An adapter that reports tier 2 but refuses a reserved cube with packed mips
+            // (GitHub's runner) does not run the shared-page path this test is about.
+            {
+                let mut cube: D3D12_RESOURCE_DESC = std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&console_desc(3, 256, 256, 6, 9, 28, 0x105)).as_ptr() as *const _);
+                cube.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+                let mut r: Option<ID3D12Resource> = None;
+                if dev.CreateReservedResource(&cube, D3D12_RESOURCE_STATE_COMMON, None, &mut r).is_err() || r.is_none() {
+                    println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: this adapter makes no reserved cube with mips");
+                    return;
+                }
             }
             super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
